@@ -5,6 +5,8 @@
 //! that are externally visible, such as:
 //! - Defining attributes on its first parameter (e.g., `self.x = 1`)
 //! - Containing yield expressions that affect the return type
+//! - Declaring global or nonlocal variables, which can change the inferred types
+//!   of variables outside the function
 
 use ruff_python_ast::{self as ast, visitor::Visitor};
 
@@ -88,6 +90,8 @@ pub(crate) fn is_trivial_body(body: &[ast::Stmt]) -> bool {
 ///   - Nested tuple/list unpacking: `(self.x, (self.y, self.z)) = f()`
 /// - Yield expressions: `yield x` or `yield from iterable`
 ///   (these affect the inferred return type, making the function a generator)
+/// - `global` or `nonlocal` declarations
+///   (these can change the inferred types of variables outside the function)
 ///
 /// Returns `false` if no externally visible effects are found.
 ///
@@ -122,6 +126,12 @@ pub(crate) fn has_externally_visible_effect(
         return true;
     }
 
+    // A function that declares global or nonlocal variables may assign to them,
+    // which affects the inferred types of variables outside the function.
+    if contains_global_or_nonlocal(body) {
+        return true;
+    }
+
     // Get the name of the first parameter (if any)
     let first_param_name = if check_attributes {
         parameters
@@ -142,6 +152,59 @@ pub(crate) fn has_externally_visible_effect(
 
     visitor.visit_body(body);
     visitor.defines_attributes || visitor.contains_yield
+}
+
+/// Check if a function body declares `global` or `nonlocal` variables.
+///
+/// Assignments to such variables are visible outside the function, so the body
+/// affects the inferred types of module level (or enclosing function) variables.
+/// This makes the body externally visible, so it must not be skipped.
+///
+/// Nested functions and classes are searched as well, since a declaration in a
+/// nested scope also refers to a variable outside the current function.
+///
+/// # Examples
+///
+/// ```python
+/// # Returns true for:
+/// def foo():
+///     global x
+///     x = 1
+///
+/// # Returns false for:
+/// def bar():
+///     x = 1
+/// ```
+pub(crate) fn contains_global_or_nonlocal(body: &[ast::Stmt]) -> bool {
+    let mut detector = GlobalDeclDetector { found: false };
+    detector.visit_body(body);
+    detector.found
+}
+
+/// Visitor that detects `global` and `nonlocal` declarations.
+struct GlobalDeclDetector {
+    /// Whether we've found a global or nonlocal declaration
+    found: bool,
+}
+
+impl<'a> Visitor<'a> for GlobalDeclDetector {
+    fn visit_stmt(&mut self, stmt: &'a ast::Stmt) {
+        // Early exit if we already found a declaration
+        if self.found {
+            return;
+        }
+
+        match stmt {
+            ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => {
+                self.found = true;
+                return;
+            }
+            _ => {}
+        }
+
+        // Continue walking the AST
+        ast::visitor::walk_stmt(self, stmt);
+    }
 }
 
 /// Visitor that detects externally visible effects in function bodies.
@@ -935,6 +998,73 @@ def foo():
 def foo():
     """Docstring"""
     return 42
+"#;
+        assert!(!check_toplevel_function(code));
+    }
+
+    // Global and nonlocal declaration tests
+
+    #[test]
+    fn test_global_declaration() {
+        let code = r#"
+def foo():
+    global x
+    x = 1
+"#;
+        assert!(check_toplevel_function(code));
+    }
+
+    #[test]
+    fn test_nonlocal_declaration() {
+        let code = r#"
+def foo():
+    x = None
+
+    def bar():
+        nonlocal x
+        x = 1
+"#;
+        assert!(check_toplevel_function(code));
+    }
+
+    #[test]
+    fn test_global_declaration_in_nested_block() {
+        let code = r#"
+def foo():
+    if True:
+        global x
+        x = 1
+"#;
+        assert!(check_toplevel_function(code));
+    }
+
+    #[test]
+    fn test_global_declaration_in_nested_function() {
+        let code = r#"
+def foo():
+    def bar():
+        global x
+        x = 1
+"#;
+        assert!(check_toplevel_function(code));
+    }
+
+    #[test]
+    fn test_global_declaration_in_method() {
+        let code = r#"
+def foo(self):
+    global x
+    x = 1
+"#;
+        assert!(check_function(code));
+    }
+
+    #[test]
+    fn test_no_global_declaration() {
+        let code = r#"
+def foo():
+    x = 1
+    return x
 "#;
         assert!(!check_toplevel_function(code));
     }
